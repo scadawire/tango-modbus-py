@@ -1,0 +1,4 @@
+pytango==9.3.2
+pymssql==2.3.1
+pymodbus==2.5.3
+pyserial==3.5
