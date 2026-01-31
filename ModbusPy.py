@@ -56,7 +56,8 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                         a.get("unit", ""),
                         a.get("write_type", ""),
                         a.get("label", ""),
-                        a.get("modifier", "")
+                        a.get("modifier", ""),
+                        a.get("register", "")
                     )
             except Exception:
                 for name in self.init_dynamic_attributes.split(","):
@@ -97,7 +98,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
     def add_dynamic_attribute(
         self, name, variable_type_name="DevString",
         min_value="", max_value="", unit="",
-        write_type_name="", label="", modifier=""
+        write_type_name="", label="", modifier="", register=""
     ):
         if not name:
             return
@@ -115,7 +116,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         attr.set_default_properties(prop)
 
         self.dynamicAttributeValueTypes[name] = var_type
-        self.dynamicAttributeModbusLookup[name] = modifier
+        self.dynamicAttributeModbusLookup[name] = register
         self.dynamicAttributes[name] = 0
 
         self.add_attribute(attr,
@@ -135,7 +136,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         self.modbusWrite(name, value)
 
     # ───────────── Modbus Logic ─────────────
-    def parse_modifier(self, name):
+    def parse_register(self, name):
         try:
             rtype, addr, count, unit = self.dynamicAttributeModbusLookup[name].split(",")
             return rtype.lower(), int(addr), int(count), int(unit)
@@ -145,7 +146,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             )
 
     def modbusRead(self, name):
-        rtype, addr, count, unit = self.parse_modifier(name)
+        rtype, addr, count, unit = self.parse_register(name)
 
         if rtype == "holding":
             rr = self.client.read_holding_registers(addr, count, unit=unit)
@@ -166,7 +167,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         raise ValueError(f"Unsupported register type: {rtype}")
 
     def modbusWrite(self, name, value):
-        rtype, addr, _, unit = self.parse_modifier(name)
+        rtype, addr, _, unit = self.parse_register(name)
 
         if rtype == "holding":
             self.client.write_register(addr, int(value), unit=unit)
