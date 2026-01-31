@@ -205,6 +205,5 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             return float(value)
         return str(value)
 
-
-if _name_ == "_main_":
+if __name__ == "__main__":
     run({os.getenv("DEVICE_SERVER_NAME"): ModbusPy})
