@@ -40,8 +40,8 @@ class ModbusPy(Device, metaclass=DeviceMeta):
     # ───────────── Lifecycle ─────────────
     def init_device(self):
         self.set_state(DevState.INIT)
+        self.get_device_properties(self.get_device_class())
         self.last_error = ""
-
         self.connect()
 
         if self.init_dynamic_attributes:
