@@ -10,7 +10,7 @@ import os
 import json
 from json import JSONDecodeError
 import traceback
-from pymodbus.client import ModbusTcpClient, ModbusSerialClient
+from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient
 
 
 class ModbusPy(Device, metaclass=DeviceMeta):
