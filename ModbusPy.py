@@ -339,8 +339,12 @@ class ModbusPy(Device, metaclass=DeviceMeta):
 
         elif variableType == CmdArgType.DevString:
             raw = str(value).encode("utf-8")
-            if len(raw) % 2 != 0:
-                raw += b"\x00"  # pad to even length for 16-bit register alignment
+            padding_needed = suboffset - len(raw)
+            if padding_needed <= 0:
+                raise Exception(f"String to long to fit into registers")
+            raw += b"\x00" * padding_needed
+            # pad to even length for 16-bit register alignment
+            if len(raw) % 2 != 0: raw += b"\x00"
             return raw
 
         else:
