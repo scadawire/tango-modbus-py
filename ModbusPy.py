@@ -186,9 +186,10 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                 f"expected: unit.type.address[.subaddress]"
             )
 
-    def _registers_needed(self, variableType):
-        """Return the number of 16-bit Modbus registers to read/write."""
+    def _registers_needed(self, variableType, subaddr):
         nbytes = self.bytes_per_variable_type(variableType)
+        if variableType == CmdArgType.DevString:
+            nbytes = subaddr
         return max(1, nbytes // 2)
 
     def modbusRead(self, name):
@@ -198,7 +199,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         rtype = register["rtype"]
         addr = register["addr"]
         var_type = lookup["variableType"]
-        count = self._registers_needed(var_type)
+        count = self._registers_needed(var_type, register["subaddr"])
 
         if rtype == "holding":
             rr = self.client.read_holding_registers(addr, count, unit=unit)
@@ -337,7 +338,10 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             return raw
 
         elif variableType == CmdArgType.DevString:
-            return str(value).encode("utf-8")
+            raw = str(value).encode("utf-8")
+            if len(raw) % 2 != 0:
+                raw += b"\x00"  # pad to even length for 16-bit register alignment
+            return raw
 
         else:
             raise Exception(f"Unsupported variable type: {variableType}")
