@@ -217,7 +217,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
 
         # Coils / discrete → return raw bool
         if rtype in ("coil", "discrete"):
-            return rr.bits[0]
+            return bool(rr.bits[0])
 
         # Holding / input → convert register list to bytes for struct.unpack
         raw = b""
@@ -245,6 +245,8 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                 self.client.write_register(addr, int(value), unit=unit)
 
         elif rtype == "coil":
+            if isinstance(value, (bytes, bytearray)):
+                value = any(b != 0 for b in value)
             self.client.write_coil(addr, bool(value), unit=unit)
         else:
             raise ValueError(f"Register type '{rtype}' is read-only")
@@ -294,8 +296,10 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         elif variableType == CmdArgType.DevBoolean:
             if isinstance(data, bool):
                 return data
-            byte_val = data[0] if isinstance(data, (bytes, bytearray)) else int(data)
-            return bool((byte_val >> suboffset) & 0x01)
+            if isinstance(data, (bytes, bytearray)):
+                val = struct.unpack(endian_prefix + "H", data[:2])[0]
+                return bool((val >> suboffset) & 0x01)
+            return bool((int(data) >> suboffset) & 0x01)
 
         elif variableType == CmdArgType.DevString:
             if isinstance(data, (bytes, bytearray)):
@@ -334,7 +338,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                 valInt = 1 << suboffset
             else:
                 valInt = 0
-            raw = struct.pack(endian_prefix + "i", int(valInt))
+            raw = struct.pack(endian_prefix + "H", int(valInt))
             return raw
 
         elif variableType == CmdArgType.DevString:
