@@ -7,7 +7,8 @@ import json
 import struct
 import traceback
 from json import JSONDecodeError
-from tango import AttrQuality, AttrWriteType, DispLevel, DevState, Attr, CmdArgType, UserDefaultAttrProp
+from tango import AttrQuality, AttrWriteType, AttrDataFormat, DispLevel, DevState
+from tango import Attr, SpectrumAttr, ImageAttr, CmdArgType, UserDefaultAttrProp
 from tango.server import Device, attribute, command, DeviceMeta, class_property, device_property, run
 from pymodbus.client.sync import ModbusTcpClient, ModbusSerialClient
 
@@ -58,6 +59,9 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                         a.get("label", ""),
                         a.get("modifier", ""),
                         a.get("register", ""),
+                        a.get("data_format", ""),
+                        str(a.get("max_x", "")),
+                        str(a.get("max_y", "")),
                     )
             except Exception:
                 for name in self.init_dynamic_attributes.split(","):
@@ -98,7 +102,8 @@ class ModbusPy(Device, metaclass=DeviceMeta):
     def add_dynamic_attribute(
         self, name, variable_type_name="DevString",
         min_value="", max_value="", unit="",
-        write_type_name="", label="", modifier="", register=""
+        write_type_name="", label="", modifier="", register="",
+        data_format_name="", max_x="", max_y=""
     ):
         if not name:
             return
@@ -106,18 +111,29 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         prop = UserDefaultAttrProp()
         var_type = self.stringValueToVarType(variable_type_name)
         write_type = self.stringValueToWriteType(write_type_name)
+        data_format = self.stringValueToFormatType(data_format_name)
+        dim_x = int(max_x) if max_x else 256
+        dim_y = int(max_y) if max_y else 256
 
         if unit:
             prop.set_unit(unit)
         if label:
             prop.set_label(label)
 
-        attr = Attr(name, var_type, write_type)
+        if data_format == AttrDataFormat.SPECTRUM:
+            attr = SpectrumAttr(name, var_type, write_type, dim_x)
+        elif data_format == AttrDataFormat.IMAGE:
+            attr = ImageAttr(name, var_type, write_type, dim_x, dim_y)
+        else:
+            attr = Attr(name, var_type, write_type)
         attr.set_default_properties(prop)
 
         self.dynamicAttributeModbusLookup[name] = {
             "variableType": var_type,
             "register": self.parse_register(register),
+            "dataFormat": data_format,
+            "max_x": dim_x,
+            "max_y": dim_y,
         }
 
         self.dynamicAttributes[name] = 0
@@ -133,26 +149,33 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         name = attr.get_name()
         lookup = self.dynamicAttributeModbusLookup[name]
         raw_data = self.modbusRead(name)
-        attr.set_value(
-            self.bytedata_to_variable(
-                raw_data,
-                lookup["variableType"],
-                lookup["register"]["subaddr"],
-            )
-        )
+        data_format = lookup.get("dataFormat", AttrDataFormat.SCALAR)
+
+        if data_format == AttrDataFormat.SPECTRUM:
+            value = self.bytedata_to_array(raw_data, lookup["variableType"], lookup["max_x"])
+        elif data_format == AttrDataFormat.IMAGE:
+            value = self.bytedata_to_image(raw_data, lookup["variableType"], lookup["max_x"], lookup["max_y"])
+        else:
+            value = self.bytedata_to_variable(raw_data, lookup["variableType"], lookup["register"]["subaddr"])
+
+        attr.set_value(value)
 
     def write_dynamic_attr(self, attr):
         name = attr.get_name()
         value = attr.get_write_value()
         lookup = self.dynamicAttributeModbusLookup[name]
-        self.modbusWrite(
-            name,
-            self.variable_to_bytedata(
-                value,
-                lookup["variableType"],
-                lookup["register"]["subaddr"],
-            ),
-        )
+        data_format = lookup.get("dataFormat", AttrDataFormat.SCALAR)
+
+        if data_format == AttrDataFormat.SPECTRUM:
+            self.modbusWrite(name, self.array_to_bytedata(value, lookup["variableType"]))
+        elif data_format == AttrDataFormat.IMAGE:
+            flat = [v for row in value for v in row]
+            self.modbusWrite(name, self.array_to_bytedata(flat, lookup["variableType"]))
+        else:
+            self.modbusWrite(
+                name,
+                self.variable_to_bytedata(value, lookup["variableType"], lookup["register"]["subaddr"]),
+            )
 
     # ───────────── Modbus Logic ─────────────
     _REGISTER_TYPE_MAP = {
@@ -186,10 +209,14 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                 f"expected: unit.type.address[.subaddress]"
             )
 
-    def _registers_needed(self, variableType, subaddr):
+    def _registers_needed(self, variableType, subaddr, data_format=AttrDataFormat.SCALAR, max_x=0, max_y=0):
         nbytes = self.bytes_per_variable_type(variableType)
         if variableType == CmdArgType.DevString:
             nbytes = subaddr
+        elif data_format == AttrDataFormat.SPECTRUM:
+            nbytes = nbytes * max_x
+        elif data_format == AttrDataFormat.IMAGE:
+            nbytes = nbytes * max_x * max_y
         return max(1, nbytes // 2)
 
     def modbusRead(self, name):
@@ -199,7 +226,11 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         rtype = register["rtype"]
         addr = register["addr"]
         var_type = lookup["variableType"]
-        count = self._registers_needed(var_type, register["subaddr"])
+        data_format = lookup.get("dataFormat", AttrDataFormat.SCALAR)
+        count = self._registers_needed(
+            var_type, register["subaddr"],
+            data_format, lookup.get("max_x", 0), lookup.get("max_y", 0),
+        )
 
         if rtype == "holding":
             rr = self.client.read_holding_registers(addr, count, unit=unit)
@@ -269,6 +300,13 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             "READ_WRITE": AttrWriteType.READ_WRITE,
             "": AttrWriteType.READ_WRITE,
         }.get(name, AttrWriteType.READ_WRITE)
+
+    def stringValueToFormatType(self, name):
+        return {
+            "SCALAR": AttrDataFormat.SCALAR,
+            "SPECTRUM": AttrDataFormat.SPECTRUM,
+            "IMAGE": AttrDataFormat.IMAGE,
+        }.get(name, AttrDataFormat.SCALAR)
 
     def _apply_word_order(self, data, size):
         chunk = data[0:size]
@@ -354,6 +392,24 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         else:
             raise Exception(f"Unsupported variable type: {variableType}")
 
+    def bytedata_to_array(self, data, variableType, count):
+        elem_size = self.bytes_per_variable_type(variableType)
+        result = []
+        for i in range(count):
+            chunk = data[i * elem_size : (i + 1) * elem_size]
+            result.append(self.bytedata_to_variable(chunk, variableType))
+        return result
+
+    def bytedata_to_image(self, data, variableType, max_x, max_y):
+        flat = self.bytedata_to_array(data, variableType, max_x * max_y)
+        return [flat[r * max_x : (r + 1) * max_x] for r in range(max_y)]
+
+    def array_to_bytedata(self, values, variableType):
+        result = b""
+        for val in values:
+            result += self.variable_to_bytedata(val, variableType)
+        return result
+
     def bytes_per_variable_type(self, variableType):
         if variableType == CmdArgType.DevShort:
             return 2
@@ -366,7 +422,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         elif variableType == CmdArgType.DevLong:
             return 4
         elif variableType == CmdArgType.DevBoolean:
-            return 1
+            return 2
         return 0
 
 if __name__ == "__main__":

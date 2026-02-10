@@ -25,7 +25,7 @@ from pymodbus.datastore import (
     ModbusServerContext,
 )
 from pymodbus.client.sync import ModbusTcpClient
-from tango import CmdArgType
+from tango import CmdArgType, AttrDataFormat
 
 from ModbusPy import ModbusPy
 
@@ -54,29 +54,48 @@ class State:
 
 # Thin helpers that call the real ModbusPy methods as unbound functions.
 
-def register_attr(s, name, register_str, var_type):
+def register_attr(s, name, register_str, var_type,
+                  data_format=AttrDataFormat.SCALAR, max_x=0, max_y=0):
     s.dynamicAttributeModbusLookup[name] = {
         "variableType": var_type,
         "register": ModbusPy.parse_register(s, register_str),
+        "dataFormat": data_format,
+        "max_x": max_x,
+        "max_y": max_y,
     }
 
 
 def read_attr(s, name):
     lookup = s.dynamicAttributeModbusLookup[name]
     raw = ModbusPy.modbusRead(s, name)
-    return ModbusPy.bytedata_to_variable(
-        s, raw, lookup["variableType"], lookup["register"]["subaddr"],
-    )
+    data_format = lookup.get("dataFormat", AttrDataFormat.SCALAR)
+
+    if data_format == AttrDataFormat.SPECTRUM:
+        return ModbusPy.bytedata_to_array(s, raw, lookup["variableType"], lookup["max_x"])
+    elif data_format == AttrDataFormat.IMAGE:
+        return ModbusPy.bytedata_to_image(s, raw, lookup["variableType"], lookup["max_x"], lookup["max_y"])
+    else:
+        return ModbusPy.bytedata_to_variable(
+            s, raw, lookup["variableType"], lookup["register"]["subaddr"],
+        )
 
 
 def write_attr(s, name, value):
     lookup = s.dynamicAttributeModbusLookup[name]
-    ModbusPy.modbusWrite(
-        s, name,
-        ModbusPy.variable_to_bytedata(
-            s, value, lookup["variableType"], lookup["register"]["subaddr"],
-        ),
-    )
+    data_format = lookup.get("dataFormat", AttrDataFormat.SCALAR)
+
+    if data_format == AttrDataFormat.SPECTRUM:
+        ModbusPy.modbusWrite(s, name, ModbusPy.array_to_bytedata(s, value, lookup["variableType"]))
+    elif data_format == AttrDataFormat.IMAGE:
+        flat = [v for row in value for v in row]
+        ModbusPy.modbusWrite(s, name, ModbusPy.array_to_bytedata(s, flat, lookup["variableType"]))
+    else:
+        ModbusPy.modbusWrite(
+            s, name,
+            ModbusPy.variable_to_bytedata(
+                s, value, lookup["variableType"], lookup["register"]["subaddr"],
+            ),
+        )
 
 
 # ===========================================================================
@@ -90,8 +109,8 @@ _server_instance = None
 
 def create_simulator_context():
     store = ModbusSlaveContext(
-        hr=ModbusSequentialDataBlock(0, [0] * 200),
-        ir=ModbusSequentialDataBlock(0, [0] * 200),
+        hr=ModbusSequentialDataBlock(0, [0] * 500),
+        ir=ModbusSequentialDataBlock(0, [0] * 500),
         co=ModbusSequentialDataBlock(0, [0] * 200),
         di=ModbusSequentialDataBlock(0, [0] * 200),
     )
@@ -127,6 +146,53 @@ def assert_equal(test_name, actual, expected, tolerance=None):
         ok = abs(actual - expected) <= tolerance
     else:
         ok = (actual == expected)
+
+    if ok:
+        passed += 1
+        print(f"  PASS  {test_name}")
+    else:
+        failed += 1
+        msg = f"  FAIL  {test_name}: expected {expected!r}, got {actual!r}"
+        print(msg)
+        errors.append(msg)
+
+
+def assert_list_equal(test_name, actual, expected, tolerance=None):
+    global passed, failed
+    ok = False
+    if len(actual) == len(expected):
+        if tolerance is not None:
+            ok = all(abs(a - e) <= tolerance for a, e in zip(actual, expected))
+        else:
+            ok = (actual == expected)
+
+    if ok:
+        passed += 1
+        print(f"  PASS  {test_name}")
+    else:
+        failed += 1
+        msg = f"  FAIL  {test_name}: expected {expected!r}, got {actual!r}"
+        print(msg)
+        errors.append(msg)
+
+
+def assert_2d_equal(test_name, actual, expected, tolerance=None):
+    global passed, failed
+    ok = False
+    if len(actual) == len(expected):
+        ok = True
+        for row_a, row_e in zip(actual, expected):
+            if len(row_a) != len(row_e):
+                ok = False
+                break
+            if tolerance is not None:
+                if not all(abs(a - e) <= tolerance for a, e in zip(row_a, row_e)):
+                    ok = False
+                    break
+            else:
+                if row_a != row_e:
+                    ok = False
+                    break
 
     if ok:
         passed += 1
@@ -489,6 +555,193 @@ def test_little_endian_over_modbus(context):
     client.close()
 
 
+# ===========================================================================
+#  Spectrum (1D) tests
+# ===========================================================================
+
+def test_spectrum_float_conversion():
+    print("\n-- spectrum conversion: DevFloat --")
+    s = State(endian="big", word_order="normal")
+
+    values = [1.5, -2.5, 3.14]
+    enc = ModbusPy.array_to_bytedata(s, values, CmdArgType.DevFloat)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevFloat, 3)
+    assert_list_equal("spectrum float encode/decode", dec, values, tolerance=1e-5)
+
+
+def test_spectrum_double_conversion():
+    print("\n-- spectrum conversion: DevDouble --")
+    s = State(endian="big", word_order="normal")
+
+    values = [1.111, 2.222, 3.333]
+    enc = ModbusPy.array_to_bytedata(s, values, CmdArgType.DevDouble)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevDouble, 3)
+    assert_list_equal("spectrum double encode/decode", dec, values, tolerance=1e-9)
+
+
+def test_spectrum_long_conversion():
+    print("\n-- spectrum conversion: DevLong --")
+    s = State(endian="big", word_order="normal")
+
+    values = [100, -200, 300, 0]
+    enc = ModbusPy.array_to_bytedata(s, values, CmdArgType.DevLong)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevLong, 4)
+    assert_list_equal("spectrum long encode/decode", dec, values)
+
+
+def test_spectrum_boolean_conversion():
+    print("\n-- spectrum conversion: DevBoolean --")
+    s = State(endian="big", word_order="normal")
+
+    values = [True, False, True, False]
+    enc = ModbusPy.array_to_bytedata(s, values, CmdArgType.DevBoolean)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 4)
+    assert_list_equal("spectrum bool encode/decode", dec, values)
+
+
+def test_spectrum_holding_float(s):
+    print("\n-- spectrum holding: DevFloat --")
+    # 5 floats starting at register 200 (5*2 = 10 registers)
+    register_attr(s, "sp_hfloat", "1.h.200", CmdArgType.DevFloat,
+                  AttrDataFormat.SPECTRUM, max_x=5)
+
+    values = [1.0, -2.5, 3.14, 0.0, 100.0]
+    write_attr(s, "sp_hfloat", values)
+    got = read_attr(s, "sp_hfloat")
+    assert_list_equal("spectrum holding float", got, values, tolerance=1e-5)
+
+
+def test_spectrum_holding_double(s):
+    print("\n-- spectrum holding: DevDouble --")
+    # 3 doubles starting at register 220 (3*4 = 12 registers)
+    register_attr(s, "sp_hdouble", "1.h.220", CmdArgType.DevDouble,
+                  AttrDataFormat.SPECTRUM, max_x=3)
+
+    values = [1.111, -2.222, 3.333]
+    write_attr(s, "sp_hdouble", values)
+    got = read_attr(s, "sp_hdouble")
+    assert_list_equal("spectrum holding double", got, values, tolerance=1e-9)
+
+
+def test_spectrum_holding_long(s):
+    print("\n-- spectrum holding: DevLong --")
+    # 4 longs starting at register 240 (4*2 = 8 registers)
+    register_attr(s, "sp_hlong", "1.h.240", CmdArgType.DevLong,
+                  AttrDataFormat.SPECTRUM, max_x=4)
+
+    values = [0, 1, -1, 2147483647]
+    write_attr(s, "sp_hlong", values)
+    got = read_attr(s, "sp_hlong")
+    assert_list_equal("spectrum holding long", got, values)
+
+
+def test_spectrum_holding_boolean(s):
+    print("\n-- spectrum holding: DevBoolean --")
+    # 4 booleans starting at register 260 (4*1 = 4 registers)
+    register_attr(s, "sp_hbool", "1.h.260", CmdArgType.DevBoolean,
+                  AttrDataFormat.SPECTRUM, max_x=4)
+
+    values = [True, False, True, False]
+    write_attr(s, "sp_hbool", values)
+    got = read_attr(s, "sp_hbool")
+    assert_list_equal("spectrum holding bool", got, values)
+
+
+def test_spectrum_input_float(s, context):
+    print("\n-- spectrum input: DevFloat (pre-seeded) --")
+    register_attr(s, "sp_ifloat", "1.i.100", CmdArgType.DevFloat,
+                  AttrDataFormat.SPECTRUM, max_x=3)
+
+    values = [10.0, 20.0, 30.0]
+    raw = b""
+    for v in values:
+        raw += struct.pack(">f", v)
+    regs = [struct.unpack(">H", raw[i:i+2])[0] for i in range(0, len(raw), 2)]
+    context[0x01].setValues(4, 100, regs)
+
+    got = read_attr(s, "sp_ifloat")
+    assert_list_equal("spectrum input float", got, values, tolerance=1e-5)
+
+
+# ===========================================================================
+#  Image (2D) tests
+# ===========================================================================
+
+def test_image_float_conversion():
+    print("\n-- image conversion: DevFloat --")
+    s = State(endian="big", word_order="normal")
+
+    data = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    flat = [v for row in data for v in row]
+    enc = ModbusPy.array_to_bytedata(s, flat, CmdArgType.DevFloat)
+    dec = ModbusPy.bytedata_to_image(s, enc, CmdArgType.DevFloat, 3, 2)
+    assert_2d_equal("image float encode/decode", dec, data, tolerance=1e-5)
+
+
+def test_image_long_conversion():
+    print("\n-- image conversion: DevLong --")
+    s = State(endian="big", word_order="normal")
+
+    data = [[1, 2], [3, 4], [5, 6]]
+    flat = [v for row in data for v in row]
+    enc = ModbusPy.array_to_bytedata(s, flat, CmdArgType.DevLong)
+    dec = ModbusPy.bytedata_to_image(s, enc, CmdArgType.DevLong, 2, 3)
+    assert_2d_equal("image long encode/decode", dec, data)
+
+
+def test_image_holding_float(s):
+    print("\n-- image holding: DevFloat --")
+    # 2x3 floats starting at register 300 (6*2 = 12 registers)
+    register_attr(s, "img_hfloat", "1.h.300", CmdArgType.DevFloat,
+                  AttrDataFormat.IMAGE, max_x=3, max_y=2)
+
+    data = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+    write_attr(s, "img_hfloat", data)
+    got = read_attr(s, "img_hfloat")
+    assert_2d_equal("image holding float", got, data, tolerance=1e-5)
+
+
+def test_image_holding_double(s):
+    print("\n-- image holding: DevDouble --")
+    # 2x2 doubles starting at register 320 (4*4 = 16 registers)
+    register_attr(s, "img_hdouble", "1.h.320", CmdArgType.DevDouble,
+                  AttrDataFormat.IMAGE, max_x=2, max_y=2)
+
+    data = [[1.1, 2.2], [3.3, 4.4]]
+    write_attr(s, "img_hdouble", data)
+    got = read_attr(s, "img_hdouble")
+    assert_2d_equal("image holding double", got, data, tolerance=1e-9)
+
+
+def test_image_holding_long(s):
+    print("\n-- image holding: DevLong --")
+    # 3x2 longs starting at register 350 (6*2 = 12 registers)
+    register_attr(s, "img_hlong", "1.h.350", CmdArgType.DevLong,
+                  AttrDataFormat.IMAGE, max_x=2, max_y=3)
+
+    data = [[10, 20], [30, 40], [50, 60]]
+    write_attr(s, "img_hlong", data)
+    got = read_attr(s, "img_hlong")
+    assert_2d_equal("image holding long", got, data)
+
+
+def test_image_input_float(s, context):
+    print("\n-- image input: DevFloat (pre-seeded) --")
+    register_attr(s, "img_ifloat", "1.i.150", CmdArgType.DevFloat,
+                  AttrDataFormat.IMAGE, max_x=2, max_y=2)
+
+    data = [[1.5, 2.5], [3.5, 4.5]]
+    raw = b""
+    for row in data:
+        for v in row:
+            raw += struct.pack(">f", v)
+    regs = [struct.unpack(">H", raw[i:i+2])[0] for i in range(0, len(raw), 2)]
+    context[0x01].setValues(4, 150, regs)
+
+    got = read_attr(s, "img_ifloat")
+    assert_2d_equal("image input float", got, data, tolerance=1e-5)
+
+
 def test_edge_cases(s):
     print("\n-- edge cases --")
     import math
@@ -532,6 +785,14 @@ def main():
     test_byte_conversions_little_endian()
     test_byte_conversions_swapped_word_order()
 
+    # -- spectrum/image conversion tests (no server needed) --
+    test_spectrum_float_conversion()
+    test_spectrum_double_conversion()
+    test_spectrum_long_conversion()
+    test_spectrum_boolean_conversion()
+    test_image_float_conversion()
+    test_image_long_conversion()
+
     # -- start simulator --
     print("\n== Starting Modbus TCP simulator on port", SIM_PORT, "==")
     context = create_simulator_context()
@@ -569,6 +830,23 @@ def main():
 
         # -- discrete input tests --
         test_discrete_input(s, context)
+
+        # -- spectrum holding register tests --
+        test_spectrum_holding_float(s)
+        test_spectrum_holding_double(s)
+        test_spectrum_holding_long(s)
+        test_spectrum_holding_boolean(s)
+
+        # -- spectrum input register tests --
+        test_spectrum_input_float(s, context)
+
+        # -- image holding register tests --
+        test_image_holding_float(s)
+        test_image_holding_double(s)
+        test_image_holding_long(s)
+
+        # -- image input register tests --
+        test_image_input_float(s, context)
 
         # -- endian / word order variants over modbus --
         test_swapped_word_order_over_modbus(context)
