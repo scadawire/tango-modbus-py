@@ -89,6 +89,8 @@ def write_attr(s, name, value):
     elif data_format == AttrDataFormat.IMAGE:
         flat = [v for row in value for v in row]
         ModbusPy.modbusWrite(s, name, ModbusPy.array_to_bytedata(s, flat, lookup["variableType"]))
+    elif lookup["variableType"] == CmdArgType.DevBoolean and lookup["register"]["rtype"] == "holding":
+        ModbusPy.modbusWriteBooleanBit(s, name, value)
     else:
         ModbusPy.modbusWrite(
             s, name,
@@ -388,6 +390,49 @@ def test_holding_register_boolean_suboffset(s):
     assert_false("holding bool bit3 False", got)
 
 
+def test_holding_register_boolean_multibit(s):
+    print("\n-- holding register: DevBoolean multi-bit (same register) --")
+    register_attr(s, "hbit0", "1.h.44.0", CmdArgType.DevBoolean)
+    register_attr(s, "hbit1", "1.h.44.1", CmdArgType.DevBoolean)
+    register_attr(s, "hbit2", "1.h.44.2", CmdArgType.DevBoolean)
+    register_attr(s, "hbit3", "1.h.44.3", CmdArgType.DevBoolean)
+
+    # Set all four bits
+    write_attr(s, "hbit0", True)
+    write_attr(s, "hbit1", True)
+    write_attr(s, "hbit2", True)
+    write_attr(s, "hbit3", True)
+
+    assert_true("multibit bit0 True", read_attr(s, "hbit0"))
+    assert_true("multibit bit1 True", read_attr(s, "hbit1"))
+    assert_true("multibit bit2 True", read_attr(s, "hbit2"))
+    assert_true("multibit bit3 True", read_attr(s, "hbit3"))
+
+    # Clear bit1 only -- bits 0, 2, 3 must remain set
+    write_attr(s, "hbit1", False)
+    assert_true("multibit bit0 still True", read_attr(s, "hbit0"))
+    assert_false("multibit bit1 now False", read_attr(s, "hbit1"))
+    assert_true("multibit bit2 still True", read_attr(s, "hbit2"))
+    assert_true("multibit bit3 still True", read_attr(s, "hbit3"))
+
+    # Clear all
+    write_attr(s, "hbit0", False)
+    write_attr(s, "hbit2", False)
+    write_attr(s, "hbit3", False)
+    assert_false("multibit bit0 cleared", read_attr(s, "hbit0"))
+    assert_false("multibit bit1 still cleared", read_attr(s, "hbit1"))
+    assert_false("multibit bit2 cleared", read_attr(s, "hbit2"))
+    assert_false("multibit bit3 cleared", read_attr(s, "hbit3"))
+
+    # Set alternating pattern
+    write_attr(s, "hbit0", True)
+    write_attr(s, "hbit2", True)
+    assert_true("alternating bit0", read_attr(s, "hbit0"))
+    assert_false("alternating bit1", read_attr(s, "hbit1"))
+    assert_true("alternating bit2", read_attr(s, "hbit2"))
+    assert_false("alternating bit3", read_attr(s, "hbit3"))
+
+
 def test_holding_register_string(s):
     print("\n-- holding register: DevString --")
     register_attr(s, "hstring", "1.h.50.20", CmdArgType.DevString)
@@ -590,13 +635,45 @@ def test_spectrum_long_conversion():
 
 
 def test_spectrum_boolean_conversion():
-    print("\n-- spectrum conversion: DevBoolean --")
+    print("\n-- spectrum conversion: DevBoolean (bit-packed) --")
     s = State(endian="big", word_order="normal")
 
+    # 4 bools should pack into 1 register (bits 0-3)
     values = [True, False, True, False]
     enc = ModbusPy.array_to_bytedata(s, values, CmdArgType.DevBoolean)
+    assert_equal("4 bools pack to 2 bytes", len(enc), 2)
+    # bit pattern: bit0=1, bit1=0, bit2=1, bit3=0 → 0b0101 = 5
+    assert_equal("4 bools packed value", struct.unpack(">H", enc)[0], 0x0005)
     dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 4)
-    assert_list_equal("spectrum bool encode/decode", dec, values)
+    assert_list_equal("spectrum bool 4 round-trip", dec, values)
+
+    # 16 bools = exactly 1 register
+    values_16 = [bool(i % 3 == 0) for i in range(16)]
+    enc = ModbusPy.array_to_bytedata(s, values_16, CmdArgType.DevBoolean)
+    assert_equal("16 bools pack to 2 bytes", len(enc), 2)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 16)
+    assert_list_equal("spectrum bool 16 round-trip", dec, values_16)
+
+    # 20 bools = 2 registers (16 + 4 bits)
+    values_20 = [bool(i % 2 == 0) for i in range(20)]
+    enc = ModbusPy.array_to_bytedata(s, values_20, CmdArgType.DevBoolean)
+    assert_equal("20 bools pack to 4 bytes", len(enc), 4)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 20)
+    assert_list_equal("spectrum bool 20 round-trip", dec, values_20)
+
+    # all True
+    values_all = [True] * 16
+    enc = ModbusPy.array_to_bytedata(s, values_all, CmdArgType.DevBoolean)
+    assert_equal("16 all-true packed", struct.unpack(">H", enc)[0], 0xFFFF)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 16)
+    assert_list_equal("spectrum bool all-true round-trip", dec, values_all)
+
+    # all False
+    values_none = [False] * 16
+    enc = ModbusPy.array_to_bytedata(s, values_none, CmdArgType.DevBoolean)
+    assert_equal("16 all-false packed", struct.unpack(">H", enc)[0], 0x0000)
+    dec = ModbusPy.bytedata_to_array(s, enc, CmdArgType.DevBoolean, 16)
+    assert_list_equal("spectrum bool all-false round-trip", dec, values_none)
 
 
 def test_spectrum_holding_float(s):
@@ -636,15 +713,33 @@ def test_spectrum_holding_long(s):
 
 
 def test_spectrum_holding_boolean(s):
-    print("\n-- spectrum holding: DevBoolean --")
-    # 4 booleans starting at register 260 (4*1 = 4 registers)
+    print("\n-- spectrum holding: DevBoolean (bit-packed) --")
+    # 4 booleans packed into 1 register at address 260
     register_attr(s, "sp_hbool", "1.h.260", CmdArgType.DevBoolean,
                   AttrDataFormat.SPECTRUM, max_x=4)
 
     values = [True, False, True, False]
     write_attr(s, "sp_hbool", values)
     got = read_attr(s, "sp_hbool")
-    assert_list_equal("spectrum holding bool", got, values)
+    assert_list_equal("spectrum holding bool 4-bit", got, values)
+
+    # 16 booleans = exactly 1 register at address 262
+    register_attr(s, "sp_hbool16", "1.h.262", CmdArgType.DevBoolean,
+                  AttrDataFormat.SPECTRUM, max_x=16)
+
+    values_16 = [True, False] * 8
+    write_attr(s, "sp_hbool16", values_16)
+    got = read_attr(s, "sp_hbool16")
+    assert_list_equal("spectrum holding bool 16-bit", got, values_16)
+
+    # 20 booleans = 2 registers at address 264
+    register_attr(s, "sp_hbool20", "1.h.264", CmdArgType.DevBoolean,
+                  AttrDataFormat.SPECTRUM, max_x=20)
+
+    values_20 = [bool(i % 3 == 0) for i in range(20)]
+    write_attr(s, "sp_hbool20", values_20)
+    got = read_attr(s, "sp_hbool20")
+    assert_list_equal("spectrum holding bool 20-bit cross-register", got, values_20)
 
 
 def test_spectrum_input_float(s, context):
@@ -815,6 +910,7 @@ def main():
         test_holding_register_long(s)
         test_holding_register_boolean(s)
         test_holding_register_boolean_suboffset(s)
+        test_holding_register_boolean_multibit(s)
         test_holding_register_string(s)
         test_holding_register_string_long(s)
 

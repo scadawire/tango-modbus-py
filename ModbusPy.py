@@ -171,6 +171,8 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         elif data_format == AttrDataFormat.IMAGE:
             flat = [v for row in value for v in row]
             self.modbusWrite(name, self.array_to_bytedata(flat, lookup["variableType"]))
+        elif lookup["variableType"] == CmdArgType.DevBoolean and lookup["register"]["rtype"] == "holding":
+            self.modbusWriteBooleanBit(name, value)
         else:
             self.modbusWrite(
                 name,
@@ -210,6 +212,9 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             )
 
     def _registers_needed(self, variableType, subaddr, data_format=AttrDataFormat.SCALAR, max_x=0, max_y=0):
+        if variableType == CmdArgType.DevBoolean and data_format in (AttrDataFormat.SPECTRUM, AttrDataFormat.IMAGE):
+            total_bits = max_x if data_format == AttrDataFormat.SPECTRUM else max_x * max_y
+            return max(1, (total_bits + 15) // 16)
         nbytes = self.bytes_per_variable_type(variableType)
         if variableType == CmdArgType.DevString:
             nbytes = subaddr
@@ -281,6 +286,25 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             self.client.write_coil(addr, bool(value), unit=unit)
         else:
             raise ValueError(f"Register type '{rtype}' is read-only")
+
+    def modbusWriteBooleanBit(self, name, value):
+        """Read-modify-write a single bit in a holding register."""
+        register = self.dynamicAttributeModbusLookup[name]["register"]
+        unit = register["unit"]
+        addr = register["addr"]
+        bit_index = register["subaddr"]
+
+        rr = self.client.read_holding_registers(addr, 1, unit=unit)
+        if rr.isError():
+            raise RuntimeError(f"Modbus read error for '{name}': {rr}")
+        current_val = rr.registers[0]
+
+        if bool(value):
+            current_val |= (1 << bit_index)
+        else:
+            current_val &= ~(1 << bit_index)
+
+        self.client.write_register(addr, current_val, unit=unit)
 
     # ───────────── Type Helpers ─────────────
     def stringValueToVarType(self, name):
@@ -393,6 +417,15 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             raise Exception(f"Unsupported variable type: {variableType}")
 
     def bytedata_to_array(self, data, variableType, count):
+        if variableType == CmdArgType.DevBoolean:
+            endian_prefix = ">" if self.endian == "big" else "<"
+            result = []
+            for i in range(count):
+                reg_index = i // 16
+                bit_index = i % 16
+                reg_val = struct.unpack(endian_prefix + "H", data[reg_index * 2 : reg_index * 2 + 2])[0]
+                result.append(bool((reg_val >> bit_index) & 0x01))
+            return result
         elem_size = self.bytes_per_variable_type(variableType)
         result = []
         for i in range(count):
@@ -405,6 +438,17 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         return [flat[r * max_x : (r + 1) * max_x] for r in range(max_y)]
 
     def array_to_bytedata(self, values, variableType):
+        if variableType == CmdArgType.DevBoolean:
+            endian_prefix = ">" if self.endian == "big" else "<"
+            num_regs = (len(values) + 15) // 16
+            regs = [0] * num_regs
+            for i, val in enumerate(values):
+                if bool(val):
+                    regs[i // 16] |= (1 << (i % 16))
+            result = b""
+            for reg in regs:
+                result += struct.pack(endian_prefix + "H", reg)
+            return result
         result = b""
         for val in values:
             result += self.variable_to_bytedata(val, variableType)
