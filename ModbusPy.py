@@ -95,7 +95,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
 
         except Exception as e:
             self.last_error = str(e)
-            self.error_stream(traceback.format_exc())
+            self.error_stream("%s", traceback.format_exc())
             self.set_state(DevState.FAULT)
 
     # ───────────── Dynamic Attributes ─────────────
