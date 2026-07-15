@@ -143,6 +143,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             r_meth=self.read_dynamic_attr,
             w_meth=self.write_dynamic_attr,
         )
+        self.set_change_event(name, True, False)
 
     # ───────────── Attribute Access ─────────────
     def read_dynamic_attr(self, attr):
@@ -178,6 +179,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                 name,
                 self.variable_to_bytedata(value, lookup["variableType"], lookup["register"]["subaddr"]),
             )
+        self.push_change_event(name, value)
 
     # ───────────── Modbus Logic ─────────────
     _REGISTER_TYPE_MAP = {
