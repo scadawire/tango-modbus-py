@@ -7,6 +7,7 @@ import json
 import struct
 import traceback
 from json import JSONDecodeError
+from threading import Thread, Lock, Event
 from tango import AttrQuality, AttrWriteType, AttrDataFormat, DispLevel, DevState
 from tango import Attr, SpectrumAttr, ImageAttr, CmdArgType, UserDefaultAttrProp
 from tango.server import Device, attribute, command, DeviceMeta, class_property, device_property, run
@@ -33,10 +34,17 @@ class ModbusPy(Device, metaclass=DeviceMeta):
     endian = device_property(dtype=str, default_value="big")
     word_order = device_property(dtype=str, default_value="normal")
 
+    health_check_interval = device_property(dtype=float, default_value=2.0)
+
     # ───────────── Internal State ─────────────
     client = None
     dynamicAttributes = {}
     dynamicAttributeModbusLookup = {}
+    # the pymodbus sync client is not safe for concurrent use: the health monitor probes it from its
+    # own thread while tango reads/writes it from the request threads
+    client_lock = Lock()
+    _health_thread = None
+    _health_stop = None
 
     # ───────────── Lifecycle ─────────────
     def init_device(self):
@@ -68,27 +76,30 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                     self.add_dynamic_attribute(name.strip())
 
         self.set_state(DevState.ON)
+        self.start_health_monitor()
 
     # ───────────── Connection ─────────────
     def connect(self):
         try:
-            if self.client:
-                self.client.close()
+            with self.client_lock:
+                if self.client:
+                    self.client.close()
 
-            if self.protocol.upper() == "TCP":
-                self.client = ModbusTcpClient(self.host, port=self.port)
-            else:
-                self.client = ModbusSerialClient(
-                    method="rtu",
-                    port=self.serial_port,
-                    baudrate=self.baudrate,
-                    parity=self.parity,
-                    stopbits=self.stopbits,
-                    bytesize=self.bytesize,
-                    timeout=1,
-                )
+                if self.protocol.upper() == "TCP":
+                    self.client = ModbusTcpClient(self.host, port=self.port)
+                else:
+                    self.client = ModbusSerialClient(
+                        method="rtu",
+                        port=self.serial_port,
+                        baudrate=self.baudrate,
+                        parity=self.parity,
+                        stopbits=self.stopbits,
+                        bytesize=self.bytesize,
+                        timeout=1,
+                    )
 
-            if not self.client.connect():
+                connected = self.client.connect()
+            if not connected:
                 raise RuntimeError("Modbus connection failed")
 
             self.info_stream("Connected to Modbus device")
@@ -97,6 +108,61 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             self.last_error = str(e)
             self.error_stream("%s", traceback.format_exc())
             self.set_state(DevState.FAULT)
+
+    # ───────────── Health monitor ─────────────
+    # pymodbus (sync) exposes no lost-connection event: is_socket_open() only flips false after an
+    # operation has already failed, and a dropped peer surfaces only as a read that raises. So the
+    # connection is watched by probing it with a real read - a last resort where the library gives no
+    # signal of its own. A driver that is up goes to FAULT when the device drops off and back to ON
+    # once it is reachable again, reconnecting in between.
+    def health_probe(self):
+        for name in self.dynamicAttributeModbusLookup:
+            try:
+                self.modbusRead(name)
+                return True
+            except Exception:
+                return False
+        return True  # nothing to probe with; assume up
+
+    def health_loop(self):
+        while not self._health_stop.wait(self.health_check_interval):
+            if self.health_probe():
+                if self.get_state() == DevState.FAULT:
+                    self.info_stream("Connection to modbus device recovered")
+                    self.set_state(DevState.ON)
+            else:
+                if self.get_state() != DevState.FAULT:
+                    self.warn_stream("Connection to modbus device lost, going to FAULT and attempting reconnect")
+                    self.set_state(DevState.FAULT)
+                self.connect()
+
+    def start_health_monitor(self):
+        self._health_stop = Event()
+        self._health_thread = Thread(target=self.health_loop, daemon=True)
+        self._health_thread.start()
+
+    def delete_device(self):
+        if self._health_stop is not None:
+            self._health_stop.set()
+        try:
+            with self.client_lock:
+                if self.client:
+                    self.client.close()
+        except Exception:
+            pass
+
+    # ───────────── Client access (serialised) ─────────────
+    def modbusRead(self, name):
+        with self.client_lock:
+            return self._modbusRead(name)
+
+    def modbusWrite(self, name, value):
+        with self.client_lock:
+            return self._modbusWrite(name, value)
+
+    def modbusWriteBooleanBit(self, name, value):
+        with self.client_lock:
+            return self._modbusWriteBooleanBit(name, value)
 
     # ───────────── Dynamic Attributes ─────────────
     def add_dynamic_attribute(
@@ -226,7 +292,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             nbytes = nbytes * max_x * max_y
         return max(1, nbytes // 2)
 
-    def modbusRead(self, name):
+    def _modbusRead(self, name):
         lookup = self.dynamicAttributeModbusLookup[name]
         register = lookup["register"]
         unit = register["unit"]
@@ -263,7 +329,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
             raw += struct.pack(">H", reg_val)  # each register is big-endian 16-bit
         return raw
 
-    def modbusWrite(self, name, value):
+    def _modbusWrite(self, name, value):
         register = self.dynamicAttributeModbusLookup[name]["register"]
         unit = register["unit"]
         rtype = register["rtype"]
@@ -289,7 +355,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
         else:
             raise ValueError(f"Register type '{rtype}' is read-only")
 
-    def modbusWriteBooleanBit(self, name, value):
+    def _modbusWriteBooleanBit(self, name, value):
         """Read-modify-write a single bit in a holding register."""
         register = self.dynamicAttributeModbusLookup[name]["register"]
         unit = register["unit"]
