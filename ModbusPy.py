@@ -29,6 +29,13 @@ class ModbusPy(Device, metaclass=DeviceMeta):
     stopbits = device_property(dtype=int, default_value=1)
     bytesize = device_property(dtype=int, default_value=8)
 
+    # how long a single transaction may wait for its response. It applies to both transports: on rtu
+    # the framer has no other way of telling that a response ended, so this is what every exchange
+    # costs when the line carries no explicit frame boundary, and a value too high there makes each
+    # read take that long regardless of payload. Keep the default at what a real rs485 run on a long
+    # cable needs and lower it where the line is short.
+    timeout = device_property(dtype=float, default_value=1.0)
+
     init_dynamic_attributes = device_property(dtype=str, default_value="")
 
     endian = device_property(dtype=str, default_value="big")
@@ -86,7 +93,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                     self.client.close()
 
                 if self.protocol.upper() == "TCP":
-                    self.client = ModbusTcpClient(self.host, port=self.port)
+                    self.client = ModbusTcpClient(self.host, port=self.port, timeout=self.timeout)
                 else:
                     self.client = ModbusSerialClient(
                         method="rtu",
@@ -95,7 +102,7 @@ class ModbusPy(Device, metaclass=DeviceMeta):
                         parity=self.parity,
                         stopbits=self.stopbits,
                         bytesize=self.bytesize,
-                        timeout=1,
+                        timeout=self.timeout,
                     )
 
                 connected = self.client.connect()
